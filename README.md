@@ -1,25 +1,24 @@
 # Vision HID Controller
 
-Vision HID Controller is a simple Python + Arduino starter project for turning
-object detections into mouse-style HID commands.
+Vision HID Controller is a Python + Arduino starter project for turning computer
+vision detections into mouse-style HID commands.
 
-The first Python version is intentionally safe: it prints simulated commands
-such as `MOVE 10 -5`, `CLICK`, and `STOP` instead of sending them directly to the
-Arduino. The Arduino sketch is ready to receive those commands over serial and
-use the `Mouse` library on an Arduino Leonardo / ATmega32U4-compatible board.
+This version focuses on the Python vision system only. It prints simulated
+commands such as `MOVE 12 -5`, `CLICK`, and `STOP`; it does not send commands to
+the Arduino yet.
 
 ## Project Structure
 
 ```text
 Vision_HID_Controller/
-├── python/
-│   └── vision_controller.py
-├── arduino/
-│   └── Vision_HID_Controller/
-│       └── Vision_HID_Controller.ino
-├── docs/
-├── requirements.txt
-└── README.md
++-- python/
+|   +-- vision_controller.py
++-- arduino/
+|   +-- Vision_HID_Controller/
+|       +-- Vision_HID_Controller.ino
++-- docs/
++-- requirements.txt
++-- README.md
 ```
 
 ## Python Setup
@@ -30,55 +29,49 @@ Install the Python dependencies:
 pip install -r requirements.txt
 ```
 
-Run with the default camera source:
+Run the vision controller:
 
 ```bash
 python python/vision_controller.py
 ```
 
-The script defaults to camera source `1`. Use source `0` if your webcam is the
-first camera device:
+On startup, the script scans available cameras, prints them, and asks which one
+to use. The selected camera is remembered for the next run.
+
+You can still provide a source directly:
 
 ```bash
-python python/vision_controller.py --source 0
+python python/vision_controller.py --source 1
 ```
 
-Press `q` in the video window to stop.
+Press `q`, `Esc`, or close the OpenCV window to stop.
 
-## What The Python Script Does
+## Vision Features
 
-- Opens a webcam, OBS Virtual Camera, or video file.
-- Runs an Ultralytics YOLO model on each frame.
-- Draws a bounding box around the highest-confidence detected object.
-- Calculates the centre point of that object.
-- Compares the object centre with the frame centre.
-- Prints simulated commands:
-  - `MOVE dx dy` when the target is away from the frame centre.
-  - `CLICK` when confidence is high enough.
-  - `STOP` when the script exits.
+- Requests `1280x720` capture from the selected camera.
+- Falls back to the highest practical resolution OpenCV can read.
+- Creates a large resizable OpenCV window.
+- Tracks only the configured target class, currently `person`.
+- Ignores detections below `0.60` confidence.
+- Draws a HUD with FPS, confidence, target centre, screen centre, raw error, and
+  movement command.
+- Prints smoothed and clamped movement commands such as `MOVE 12 -5`.
 
 ## Arduino Setup
 
-Use an Arduino Leonardo, Micro, Pro Micro, or another ATmega32U4-based board.
-Those boards can act as USB HID mouse devices.
+The Arduino sketch is included for later hardware integration. Use an Arduino
+Leonardo, Micro, Pro Micro, or another ATmega32U4-based board.
 
-1. Open `arduino/Vision_HID_Controller/Vision_HID_Controller.ino` in the Arduino
-   IDE.
-2. Select your Leonardo / ATmega32U4 board and port.
-3. Upload the sketch.
-4. Open the Serial Monitor at `115200` baud to test commands.
-
-Example serial commands:
+Open this sketch in the Arduino IDE:
 
 ```text
-MOVE 10 -5
-CLICK
-STOP
-START
+arduino/Vision_HID_Controller/Vision_HID_Controller.ino
 ```
+
+This project does not connect Python to Arduino serial yet.
 
 ## Safety Notes
 
-The Arduino sketch can move and click the real mouse. Keep movements small while
-testing, and use `STOP` to disable HID actions. Send `START` to enable them
-again.
+The Python script only prints simulated commands. The Arduino sketch can move and
+click the real mouse once serial integration is added later, so keep movement
+limits small during future hardware testing.
