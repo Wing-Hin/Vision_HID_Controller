@@ -245,11 +245,12 @@ def detect_objects(
     frame: Any,
     target_class: str,
     min_confidence: float,
+    screen_centre: tuple[int, int],
 ) -> dict[str, Any] | None:
-    """Find the highest-confidence detection matching the target class."""
+    """Find the target-class detection closest to the screen centre."""
     results = model(frame, conf=min_confidence, verbose=False)
-    best_detection = None
-    best_confidence = -1.0
+    closest_detection = None
+    closest_distance_squared = None
 
     for result in results:
         for box in result.boxes:
@@ -260,19 +261,27 @@ def detect_objects(
             if label != target_class or confidence < min_confidence:
                 continue
 
-            if confidence > best_confidence:
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                centre_x = int((x1 + x2) / 2)
-                centre_y = int((y1 + y2) / 2)
-                best_confidence = confidence
-                best_detection = {
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            centre_x = int((x1 + x2) / 2)
+            centre_y = int((y1 + y2) / 2)
+            error_x = centre_x - screen_centre[0]
+            error_y = centre_y - screen_centre[1]
+            distance_squared = error_x * error_x + error_y * error_y
+
+            if (
+                closest_distance_squared is None
+                or distance_squared < closest_distance_squared
+            ):
+                closest_distance_squared = distance_squared
+                closest_detection = {
                     "label": label,
                     "confidence": confidence,
                     "box": (int(x1), int(y1), int(x2), int(y2)),
                     "centre": (centre_x, centre_y),
+                    "distance_squared": distance_squared,
                 }
 
-    return best_detection
+    return closest_detection
 
 
 def calculate_mouse_command(
@@ -288,6 +297,7 @@ def calculate_mouse_command(
             "raw_error": (0, 0),
             "move": (0, 0),
             "command": "STOP",
+            "status": "NO TARGET",
         }
 
     raw_dx = target_centre[0] - screen_centre[0]
@@ -299,12 +309,15 @@ def calculate_mouse_command(
     move_x = clamp(move_x, -max_speed, max_speed)
     move_y = clamp(move_y, -max_speed, max_speed)
 
-    command = "STOP" if move_x == 0 and move_y == 0 else f"MOVE {move_x} {move_y}"
+    target_is_centered = move_x == 0 and move_y == 0
+    command = "MOVE 0 0" if target_is_centered else f"MOVE {move_x} {move_y}"
+    status = "LOCKED" if target_is_centered else "TRACKING"
 
     return {
         "raw_error": (raw_dx, raw_dy),
         "move": (move_x, move_y),
         "command": command,
+        "status": status,
     }
 
 
@@ -335,6 +348,7 @@ def draw_overlay(
     screen_centre = (width // 2, height // 2)
     target_centre = detection["centre"] if detection else None
     confidence = detection["confidence"] if detection else 0.0
+    target_distance = detection["distance_squared"] ** 0.5 if detection else 0.0
 
     cv2.drawMarker(
         frame,
@@ -368,7 +382,9 @@ def draw_overlay(
         ("Confidence", f"{confidence:.2f}"),
         ("Target centre", target_text),
         ("Screen centre", str(screen_centre)),
+        ("Target distance", f"{target_distance:.1f}px"),
         ("Raw error", str(movement["raw_error"])),
+        ("Status", movement["status"]),
         ("Movement command", movement["command"]),
     ]
 
@@ -415,6 +431,7 @@ def main() -> None:
             frame,
             args.target_class,
             args.confidence,
+            screen_centre,
         )
         target_centre = detection["centre"] if detection else None
         movement = calculate_mouse_command(
