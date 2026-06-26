@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -27,11 +28,24 @@ MIN_CONFIDENCE = 0.60
 DEADZONE = 20
 SENSITIVITY = 0.08
 MAX_SPEED = 40
+SMOOTHING_ALPHA = 0.25
 CLICK_CONFIDENCE = 0.90
 CLICK_COOLDOWN_SECONDS = 1.0
 
 REQUESTED_WIDTH = 1280
 REQUESTED_HEIGHT = 720
+REQUESTED_FPS = 60
+CAPTURE_MODES = [
+    (1280, 720),
+    (960, 540),
+    (854, 480),
+    (640, 360),
+    (800, 600),
+    (640, 480),
+    (424, 240),
+    (320, 240),
+]
+INFERENCE_SIZE = 320
 DISPLAY_WIDTH = 1280
 DISPLAY_HEIGHT = 720
 
@@ -80,6 +94,41 @@ def parse_args() -> argparse.Namespace:
         default=MAX_SPEED,
         help="Clamp each movement axis to this maximum absolute value.",
     )
+    parser.add_argument(
+        "--smoothing",
+        type=float,
+        default=SMOOTHING_ALPHA,
+        help="Low-pass filter amount from 0.0 to 1.0. Lower is smoother.",
+    )
+    parser.add_argument(
+        "--fps",
+        type=int,
+        default=REQUESTED_FPS,
+        help="Requested camera capture FPS.",
+    )
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=REQUESTED_WIDTH,
+        help="Preferred camera capture width.",
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=REQUESTED_HEIGHT,
+        help="Preferred camera capture height.",
+    )
+    parser.add_argument(
+        "--imgsz",
+        type=int,
+        default=INFERENCE_SIZE,
+        help="YOLO inference image size. Smaller is faster but less precise.",
+    )
+    parser.add_argument(
+        "--device",
+        default=None,
+        help="Optional YOLO device, such as cpu, cuda, or 0. Leave unset for auto.",
+    )
     return parser.parse_args()
 
 
@@ -98,7 +147,7 @@ def discover_cameras(max_index: int = 10) -> list[dict[str, int]]:
     cameras = []
 
     for index in range(max_index):
-        cap = cv2.VideoCapture(index)
+        cap = open_camera_index(index)
 
         if cap.isOpened():
             ok, frame = cap.read()
@@ -109,6 +158,14 @@ def discover_cameras(max_index: int = 10) -> list[dict[str, int]]:
         cap.release()
 
     return cameras
+
+
+def open_camera_index(index: int) -> cv2.VideoCapture:
+    """Open a numeric camera index with a stable backend for the current OS."""
+    if os.name == "nt":
+        return cv2.VideoCapture(index, cv2.CAP_DSHOW)
+
+    return cv2.VideoCapture(index)
 
 
 def load_remembered_camera() -> int | None:
@@ -170,7 +227,12 @@ def choose_camera(cameras: list[dict[str, int]]) -> int:
     return selected_index
 
 
-def open_camera(source: str | None) -> cv2.VideoCapture:
+def open_camera(
+    source: str | None,
+    preferred_width: int,
+    preferred_height: int,
+    requested_fps: int,
+) -> cv2.VideoCapture:
     """
     Open a camera, video file, or stream.
 
@@ -180,75 +242,107 @@ def open_camera(source: str | None) -> cv2.VideoCapture:
     if source is None:
         cameras = discover_cameras()
         camera_index = choose_camera(cameras)
-        cap = cv2.VideoCapture(camera_index)
+        cap = open_camera_index(camera_index)
     elif source.isdigit():
         camera_index = int(source)
         remember_camera(camera_index)
-        cap = cv2.VideoCapture(camera_index)
+        cap = open_camera_index(camera_index)
     else:
         cap = cv2.VideoCapture(source)
 
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video source: {source}")
 
-    configure_capture_resolution(cap)
+    configure_capture(cap, preferred_width, preferred_height, requested_fps)
     return cap
 
 
-def configure_capture_resolution(cap: cv2.VideoCapture) -> None:
+def configure_capture(
+    cap: cv2.VideoCapture,
+    preferred_width: int,
+    preferred_height: int,
+    requested_fps: int,
+) -> None:
     """
-    Request 1280x720, then fall back to the highest practical resolution found.
+    Request the preferred size at 60 FPS, then try smaller 60 FPS-friendly modes.
 
-    Many cameras quietly choose the nearest supported mode. We test a short list
-    of common sizes and keep the largest area that returns a valid frame.
+    Many webcams need MJPG mode to reach 60 FPS. OpenCV still depends on the
+    camera driver, so we test common sizes and keep the one with the best
+    reported FPS. If FPS ties, we keep the larger image.
     """
-    candidates = [
-        (REQUESTED_WIDTH, REQUESTED_HEIGHT),
-        (3840, 2160),
-        (2560, 1440),
-        (1920, 1080),
-        (1600, 900),
-        (1280, 720),
-        (1024, 768),
-        (800, 600),
-        (640, 480),
-    ]
-    best_size = None
-    best_area = 0
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+
+    candidates = [(preferred_width, preferred_height)]
+    for mode in CAPTURE_MODES:
+        if mode not in candidates:
+            candidates.append(mode)
+
+    best_mode = None
+    best_score = None
 
     for width, height in candidates:
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        cap.set(cv2.CAP_PROP_FPS, requested_fps)
 
         ok, frame = cap.read()
         if not ok:
             continue
 
         actual_height, actual_width = frame.shape[:2]
+        actual_fps = cap.get(cv2.CAP_PROP_FPS)
         actual_area = actual_width * actual_height
+        fps_error = abs(requested_fps - actual_fps) if actual_fps > 0 else requested_fps
 
-        if (actual_width, actual_height) == (REQUESTED_WIDTH, REQUESTED_HEIGHT):
-            best_size = (actual_width, actual_height)
+        print(
+            "Tested mode: "
+            f"requested {width}x{height}@{requested_fps}, "
+            f"got {actual_width}x{actual_height}@{actual_fps:.1f}"
+        )
+
+        score = (fps_error, -actual_fps, -actual_area)
+
+        if best_score is None or score < best_score:
+            best_score = score
+            best_mode = (actual_width, actual_height, actual_fps)
+
+        if actual_fps >= requested_fps and actual_width == width and actual_height == height:
+            best_mode = (actual_width, actual_height, actual_fps)
             break
 
-        if actual_area > best_area:
-            best_area = actual_area
-            best_size = (actual_width, actual_height)
-
-    if best_size is not None:
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, best_size[0])
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, best_size[1])
+    if best_mode is not None:
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, best_mode[0])
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, best_mode[1])
+        cap.set(cv2.CAP_PROP_FPS, requested_fps)
 
 
 def detect_objects(
     model: YOLO,
     frame: Any,
     target_class: str,
+    target_class_id: int | None,
     min_confidence: float,
     screen_centre: tuple[int, int],
+    inference_size: int,
+    device: str | None,
 ) -> dict[str, Any] | None:
     """Find the target-class detection closest to the screen centre."""
-    results = model(frame, conf=min_confidence, verbose=False)
+    class_filter = [target_class_id] if target_class_id is not None else None
+    model_options = {
+        "conf": min_confidence,
+        "imgsz": inference_size,
+        "classes": class_filter,
+        "verbose": False,
+    }
+
+    if device is not None:
+        model_options["device"] = device
+
+    results = model(frame, **model_options)
     closest_detection = None
     closest_distance_squared = None
 
@@ -284,18 +378,40 @@ def detect_objects(
     return closest_detection
 
 
+def find_class_id(model: YOLO, target_class: str) -> int | None:
+    """Find the numeric YOLO class id for a class name such as person."""
+    for class_id, class_name in model.names.items():
+        if class_name == target_class:
+            return int(class_id)
+
+    return None
+
+
+def optimize_model(model: YOLO) -> None:
+    """Apply safe Ultralytics optimizations when available."""
+    try:
+        model.fuse()
+    except (AttributeError, RuntimeError):
+        pass
+
+
 def calculate_mouse_command(
     target_centre: tuple[int, int] | None,
     screen_centre: tuple[int, int],
+    previous_move: tuple[float, float],
     deadzone: int,
     sensitivity: float,
     max_speed: int,
+    smoothing_alpha: float,
 ) -> dict[str, Any]:
     """Convert raw pixel error into a smooth, clamped MOVE command."""
+    smoothing_alpha = max(0.0, min(1.0, smoothing_alpha))
+
     if target_centre is None:
         return {
             "raw_error": (0, 0),
             "move": (0, 0),
+            "filtered_move": (0.0, 0.0),
             "command": "STOP",
             "status": "NO TARGET",
         }
@@ -303,19 +419,40 @@ def calculate_mouse_command(
     raw_dx = target_centre[0] - screen_centre[0]
     raw_dy = target_centre[1] - screen_centre[1]
 
-    move_x = 0 if abs(raw_dx) <= deadzone else int(raw_dx * sensitivity)
-    move_y = 0 if abs(raw_dy) <= deadzone else int(raw_dy * sensitivity)
+    target_move_x = 0 if abs(raw_dx) <= deadzone else raw_dx * sensitivity
+    target_move_y = 0 if abs(raw_dy) <= deadzone else raw_dy * sensitivity
 
-    move_x = clamp(move_x, -max_speed, max_speed)
-    move_y = clamp(move_y, -max_speed, max_speed)
+    target_move_x = clamp(int(target_move_x), -max_speed, max_speed)
+    target_move_y = clamp(int(target_move_y), -max_speed, max_speed)
 
-    target_is_centered = move_x == 0 and move_y == 0
-    command = "MOVE 0 0" if target_is_centered else f"MOVE {move_x} {move_y}"
-    status = "LOCKED" if target_is_centered else "TRACKING"
+    # Low-pass filter: move partway from the previous command toward the new one.
+    filtered_x = previous_move[0] + smoothing_alpha * (target_move_x - previous_move[0])
+    filtered_y = previous_move[1] + smoothing_alpha * (target_move_y - previous_move[1])
+
+    if abs(filtered_x) < 0.5:
+        filtered_x = 0.0
+    if abs(filtered_y) < 0.5:
+        filtered_y = 0.0
+
+    move_x = clamp(round(filtered_x), -max_speed, max_speed)
+    move_y = clamp(round(filtered_y), -max_speed, max_speed)
+
+    target_is_centered = target_move_x == 0 and target_move_y == 0
+    filtered_is_stopped = move_x == 0 and move_y == 0
+    command = "MOVE 0 0" if filtered_is_stopped else f"MOVE {move_x} {move_y}"
+
+    if target_is_centered and filtered_is_stopped:
+        status = "LOCKED"
+    elif target_is_centered:
+        status = "SETTLING"
+    else:
+        status = "TRACKING"
 
     return {
         "raw_error": (raw_dx, raw_dy),
         "move": (move_x, move_y),
+        "target_move": (target_move_x, target_move_y),
+        "filtered_move": (filtered_x, filtered_y),
         "command": command,
         "status": status,
     }
@@ -340,7 +477,8 @@ def draw_overlay(
     frame: Any,
     detection: dict[str, Any] | None,
     movement: dict[str, Any],
-    fps: float,
+    processing_fps: float,
+    camera_fps: float,
     target_class: str,
 ) -> None:
     """Draw the target overlay, crosshair, guide line, and HUD."""
@@ -377,13 +515,15 @@ def draw_overlay(
 
     target_text = str(target_centre) if target_centre else "None"
     hud_rows = [
-        ("FPS", f"{fps:.1f}"),
+        ("Camera FPS", f"{camera_fps:.1f}"),
+        ("Processing FPS", f"{processing_fps:.1f}"),
         ("Target class", target_class),
         ("Confidence", f"{confidence:.2f}"),
         ("Target centre", target_text),
         ("Screen centre", str(screen_centre)),
         ("Target distance", f"{target_distance:.1f}px"),
         ("Raw error", str(movement["raw_error"])),
+        ("Filtered move", f"({movement['filtered_move'][0]:.1f}, {movement['filtered_move'][1]:.1f})"),
         ("Status", movement["status"]),
         ("Movement command", movement["command"]),
     ]
@@ -395,23 +535,34 @@ def draw_overlay(
 def main() -> None:
     args = parse_args()
     model = YOLO(args.model)
-    cap = open_camera(args.source)
+    optimize_model(model)
+    target_class_id = find_class_id(model, args.target_class)
+    cap = open_camera(args.source, args.width, args.height, args.fps)
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW_NAME, DISPLAY_WIDTH, DISPLAY_HEIGHT)
 
     actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    actual_fps = cap.get(cv2.CAP_PROP_FPS)
 
     print("Vision HID Controller started")
     print(f"Target class: {args.target_class}")
+    if target_class_id is not None:
+        print(f"Target class id: {target_class_id}")
+    else:
+        print("Target class id: not found, filtering by class name after detection")
     print(f"Minimum confidence: {args.confidence:.2f}")
     print(f"Capture size: {actual_width}x{actual_height}")
+    print(f"Requested capture FPS: {args.fps}")
+    print(f"Reported capture FPS: {actual_fps:.1f}")
+    print(f"YOLO inference size: {args.imgsz}")
     print("Press q or Esc in the video window to quit")
 
     previous_time = time.perf_counter()
     last_click_time = 0.0
     last_command = ""
+    previous_move = (0.0, 0.0)
 
     while True:
         ok, frame = cap.read()
@@ -422,7 +573,7 @@ def main() -> None:
         current_time = time.perf_counter()
         elapsed = current_time - previous_time
         previous_time = current_time
-        fps = 1.0 / elapsed if elapsed > 0 else 0.0
+        processing_fps = 1.0 / elapsed if elapsed > 0 else 0.0
 
         height, width = frame.shape[:2]
         screen_centre = (width // 2, height // 2)
@@ -430,17 +581,23 @@ def main() -> None:
             model,
             frame,
             args.target_class,
+            target_class_id,
             args.confidence,
             screen_centre,
+            args.imgsz,
+            args.device,
         )
         target_centre = detection["centre"] if detection else None
         movement = calculate_mouse_command(
             target_centre,
             screen_centre,
+            previous_move,
             args.deadzone,
             args.sensitivity,
             args.max_speed,
+            args.smoothing,
         )
+        previous_move = movement["filtered_move"]
 
         if movement["command"] != last_command:
             print(movement["command"])
@@ -454,7 +611,14 @@ def main() -> None:
             print("CLICK")
             last_click_time = current_time
 
-        draw_overlay(frame, detection, movement, fps, args.target_class)
+        draw_overlay(
+            frame,
+            detection,
+            movement,
+            processing_fps,
+            actual_fps,
+            args.target_class,
+        )
         cv2.imshow(WINDOW_NAME, frame)
 
         key = cv2.waitKey(1) & 0xFF
