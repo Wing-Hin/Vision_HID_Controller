@@ -330,7 +330,7 @@ def detect_objects(
     inference_size: int,
     device: str | None,
 ) -> dict[str, Any] | None:
-    """Find the target-class detection closest to the screen centre."""
+    """Build all valid target candidates and return the best-ranked one."""
     class_filter = [target_class_id] if target_class_id is not None else None
     model_options = {
         "conf": min_confidence,
@@ -343,8 +343,7 @@ def detect_objects(
         model_options["device"] = device
 
     results = model(frame, **model_options)
-    closest_detection = None
-    closest_distance_squared = None
+    candidates: list[dict[str, Any]] = []
 
     for result in results:
         for box in result.boxes:
@@ -361,21 +360,31 @@ def detect_objects(
             error_x = centre_x - screen_centre[0]
             error_y = centre_y - screen_centre[1]
             distance_squared = error_x * error_x + error_y * error_y
+            area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
 
-            if (
-                closest_distance_squared is None
-                or distance_squared < closest_distance_squared
-            ):
-                closest_distance_squared = distance_squared
-                closest_detection = {
+            candidates.append(
+                {
                     "label": label,
                     "confidence": confidence,
                     "box": (int(x1), int(y1), int(x2), int(y2)),
                     "centre": (centre_x, centre_y),
                     "distance_squared": distance_squared,
+                    "area": area,
                 }
+            )
 
-    return closest_detection
+    if not candidates:
+        return None
+
+    # Primary: nearest to frame centre. Ties then favor confidence and size.
+    return min(
+        candidates,
+        key=lambda candidate: (
+            candidate["distance_squared"],
+            -candidate["confidence"],
+            -candidate["area"],
+        ),
+    )
 
 
 def find_class_id(model: YOLO, target_class: str) -> int | None:
