@@ -29,6 +29,8 @@ DEADZONE = 20
 SENSITIVITY = 0.08
 MAX_SPEED = 40
 SMOOTHING_ALPHA = 0.25
+LOST_TIMEOUT = 0.5
+MIN_LOCK_MATCH_DISTANCE = 80
 CLICK_CONFIDENCE = 0.90
 CLICK_COOLDOWN_SECONDS = 1.0
 
@@ -51,6 +53,9 @@ DISPLAY_HEIGHT = 720
 
 CAMERA_MEMORY_FILE = Path(__file__).with_name("camera_selection.json")
 WINDOW_NAME = "Vision HID Controller"
+NO_TARGET = "NO_TARGET"
+LOCKED = "LOCKED"
+LOST = "LOST"
 
 
 def parse_args() -> argparse.Namespace:
@@ -329,8 +334,8 @@ def detect_objects(
     screen_centre: tuple[int, int],
     inference_size: int,
     device: str | None,
-) -> dict[str, Any] | None:
-    """Build all valid target candidates and return the best-ranked one."""
+) -> list[dict[str, Any]]:
+    """Build all valid target candidates for the current frame."""
     class_filter = [target_class_id] if target_class_id is not None else None
     model_options = {
         "conf": min_confidence,
@@ -373,6 +378,11 @@ def detect_objects(
                 }
             )
 
+    return candidates
+
+
+def choose_best_target(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Choose the best target by frame-centre distance, confidence, then size."""
     if not candidates:
         return None
 
@@ -385,6 +395,175 @@ def detect_objects(
             -candidate["area"],
         ),
     )
+
+
+def distance_squared(
+    first_centre: tuple[int, int],
+    second_centre: tuple[int, int],
+) -> int:
+    """Return squared pixel distance between two centre points."""
+    error_x = first_centre[0] - second_centre[0]
+    error_y = first_centre[1] - second_centre[1]
+    return error_x * error_x + error_y * error_y
+
+
+def smooth_target_centre(
+    new_centre: tuple[int, int],
+    previous_centre: tuple[int, int] | None,
+    smoothing_alpha: float,
+) -> tuple[int, int]:
+    """Apply exponential smoothing to the target centre."""
+    smoothing_alpha = max(0.0, min(1.0, smoothing_alpha))
+
+    if previous_centre is None:
+        return new_centre
+
+    smoothed_x = smoothing_alpha * new_centre[0] + (1.0 - smoothing_alpha) * previous_centre[0]
+    smoothed_y = smoothing_alpha * new_centre[1] + (1.0 - smoothing_alpha) * previous_centre[1]
+    return (round(smoothed_x), round(smoothed_y))
+
+
+def copy_tracked_detection(
+    detection: dict[str, Any],
+    centre: tuple[int, int],
+    state: str,
+    visible: bool,
+) -> dict[str, Any]:
+    """Return a detection copy annotated with lock information."""
+    tracked_detection = detection.copy()
+    tracked_detection["raw_centre"] = detection["centre"]
+    tracked_detection["centre"] = centre
+    tracked_detection["lock_state"] = state
+    tracked_detection["visible"] = visible
+    return tracked_detection
+
+
+def reset_target_lock(target_lock: dict[str, Any]) -> None:
+    """Clear the remembered target lock state."""
+    target_lock["state"] = NO_TARGET
+    target_lock["last_detection"] = None
+    target_lock["last_raw_centre"] = None
+    target_lock["smoothed_centre"] = None
+    target_lock["lost_since"] = None
+
+
+def lock_match_distance_limit(detection: dict[str, Any] | None) -> float:
+    """Return the largest reasonable centre jump for the current locked target."""
+    if detection is None:
+        return float(MIN_LOCK_MATCH_DISTANCE)
+
+    x1, y1, x2, y2 = detection["box"]
+    width = x2 - x1
+    height = y2 - y1
+    return max(float(MIN_LOCK_MATCH_DISTANCE), width, height)
+
+
+def mark_target_lost(
+    target_lock: dict[str, Any],
+    current_time: float,
+) -> dict[str, Any] | None:
+    """Keep the last target position briefly after the target disappears."""
+    if target_lock["lost_since"] is None:
+        target_lock["lost_since"] = current_time
+
+    if current_time - target_lock["lost_since"] <= LOST_TIMEOUT:
+        target_lock["state"] = LOST
+        last_detection = target_lock["last_detection"]
+        if last_detection is None:
+            return None
+
+        lost_detection = last_detection.copy()
+        lost_detection["lock_state"] = LOST
+        lost_detection["visible"] = False
+        return lost_detection
+
+    reset_target_lock(target_lock)
+    return None
+
+
+def update_target_lock(
+    candidates: list[dict[str, Any]],
+    target_lock: dict[str, Any],
+    current_time: float,
+    smoothing_alpha: float,
+) -> dict[str, Any] | None:
+    """
+    Keep a stable target lock across frames.
+
+    A fresh lock uses the normal target scoring. Once locked, the tracker follows
+    the closest new detection to the previous target centre instead of switching
+    to a different candidate each frame. If the target vanishes briefly, the last
+    smoothed position is kept until LOST_TIMEOUT expires.
+    """
+    if (
+        target_lock["state"] == LOST
+        and target_lock["lost_since"] is not None
+        and current_time - target_lock["lost_since"] > LOST_TIMEOUT
+    ):
+        reset_target_lock(target_lock)
+
+    previous_raw_centre = target_lock["last_raw_centre"]
+    previous_smoothed_centre = target_lock["smoothed_centre"]
+    has_active_lock = target_lock["state"] in (LOCKED, LOST) and previous_raw_centre is not None
+
+    if has_active_lock and candidates:
+        matched_detection = min(
+            candidates,
+            key=lambda candidate: distance_squared(candidate["centre"], previous_raw_centre),
+        )
+        match_distance_limit = lock_match_distance_limit(target_lock["last_detection"])
+
+        if (
+            distance_squared(matched_detection["centre"], previous_raw_centre)
+            > match_distance_limit * match_distance_limit
+        ):
+            return mark_target_lost(target_lock, current_time)
+
+        smoothed_centre = smooth_target_centre(
+            matched_detection["centre"],
+            previous_smoothed_centre,
+            smoothing_alpha,
+        )
+        tracked_detection = copy_tracked_detection(
+            matched_detection,
+            smoothed_centre,
+            LOCKED,
+            True,
+        )
+
+        target_lock["state"] = LOCKED
+        target_lock["last_detection"] = tracked_detection
+        target_lock["last_raw_centre"] = matched_detection["centre"]
+        target_lock["smoothed_centre"] = smoothed_centre
+        target_lock["lost_since"] = None
+        return tracked_detection
+
+    if has_active_lock and not candidates:
+        return mark_target_lost(target_lock, current_time)
+
+    selected_detection = choose_best_target(candidates)
+    if selected_detection is None:
+        reset_target_lock(target_lock)
+        return None
+
+    smoothed_centre = smooth_target_centre(
+        selected_detection["centre"],
+        previous_smoothed_centre,
+        smoothing_alpha,
+    )
+    tracked_detection = copy_tracked_detection(
+        selected_detection,
+        smoothed_centre,
+        LOCKED,
+        True,
+    )
+
+    target_lock["state"] = LOCKED
+    target_lock["last_detection"] = tracked_detection
+    target_lock["last_raw_centre"] = selected_detection["centre"]
+    target_lock["smoothed_centre"] = smoothed_centre
+    target_lock["lost_since"] = None
+    return tracked_detection
 
 
 def find_class_id(model: YOLO, target_class: str) -> int | None:
@@ -412,6 +591,7 @@ def calculate_mouse_command(
     sensitivity: float,
     max_speed: int,
     smoothing_alpha: float,
+    tracking_state: str,
 ) -> dict[str, Any]:
     """Convert raw pixel error into a smooth, clamped MOVE command."""
     smoothing_alpha = max(0.0, min(1.0, smoothing_alpha))
@@ -422,7 +602,7 @@ def calculate_mouse_command(
             "move": (0, 0),
             "filtered_move": (0.0, 0.0),
             "command": "STOP",
-            "status": "NO TARGET",
+            "status": NO_TARGET,
         }
 
     raw_dx = target_centre[0] - screen_centre[0]
@@ -446,16 +626,8 @@ def calculate_mouse_command(
     move_x = clamp(round(filtered_x), -max_speed, max_speed)
     move_y = clamp(round(filtered_y), -max_speed, max_speed)
 
-    target_is_centered = target_move_x == 0 and target_move_y == 0
     filtered_is_stopped = move_x == 0 and move_y == 0
     command = "MOVE 0 0" if filtered_is_stopped else f"MOVE {move_x} {move_y}"
-
-    if target_is_centered and filtered_is_stopped:
-        status = "LOCKED"
-    elif target_is_centered:
-        status = "SETTLING"
-    else:
-        status = "TRACKING"
 
     return {
         "raw_error": (raw_dx, raw_dy),
@@ -463,7 +635,7 @@ def calculate_mouse_command(
         "target_move": (target_move_x, target_move_y),
         "filtered_move": (filtered_x, filtered_y),
         "command": command,
-        "status": status,
+        "status": tracking_state,
     }
 
 
@@ -496,6 +668,8 @@ def draw_overlay(
     target_centre = detection["centre"] if detection else None
     confidence = detection["confidence"] if detection else 0.0
     target_distance = detection["distance_squared"] ** 0.5 if detection else 0.0
+    lock_state = detection["lock_state"] if detection else NO_TARGET
+    visible = detection.get("visible", False) if detection else False
 
     cv2.drawMarker(
         frame,
@@ -508,7 +682,8 @@ def draw_overlay(
 
     if detection is not None:
         x1, y1, x2, y2 = detection["box"]
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        box_colour = (0, 255, 0) if visible else (0, 165, 255)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), box_colour, 2)
         cv2.circle(frame, target_centre, 6, (0, 0, 255), -1)
         cv2.line(frame, screen_centre, target_centre, (0, 255, 255), 2)
 
@@ -518,7 +693,7 @@ def draw_overlay(
             (x1, max(25, y1 - 8)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
-            (0, 255, 0),
+            box_colour,
             2,
         )
 
@@ -527,6 +702,7 @@ def draw_overlay(
         ("Camera FPS", f"{camera_fps:.1f}"),
         ("Processing FPS", f"{processing_fps:.1f}"),
         ("Target class", target_class),
+        ("Target lock", lock_state),
         ("Confidence", f"{confidence:.2f}"),
         ("Target centre", target_text),
         ("Screen centre", str(screen_centre)),
@@ -572,6 +748,13 @@ def main() -> None:
     last_click_time = 0.0
     last_command = ""
     previous_move = (0.0, 0.0)
+    target_lock: dict[str, Any] = {
+        "state": NO_TARGET,
+        "last_detection": None,
+        "last_raw_centre": None,
+        "smoothed_centre": None,
+        "lost_since": None,
+    }
 
     while True:
         ok, frame = cap.read()
@@ -586,7 +769,7 @@ def main() -> None:
 
         height, width = frame.shape[:2]
         screen_centre = (width // 2, height // 2)
-        detection = detect_objects(
+        candidates = detect_objects(
             model,
             frame,
             args.target_class,
@@ -595,6 +778,12 @@ def main() -> None:
             screen_centre,
             args.imgsz,
             args.device,
+        )
+        detection = update_target_lock(
+            candidates,
+            target_lock,
+            current_time,
+            args.smoothing,
         )
         target_centre = detection["centre"] if detection else None
         movement = calculate_mouse_command(
@@ -605,6 +794,7 @@ def main() -> None:
             args.sensitivity,
             args.max_speed,
             args.smoothing,
+            detection["lock_state"] if detection else NO_TARGET,
         )
         previous_move = movement["filtered_move"]
 
@@ -614,6 +804,7 @@ def main() -> None:
 
         if (
             detection
+            and detection.get("visible", True)
             and detection["confidence"] >= CLICK_CONFIDENCE
             and current_time - last_click_time >= CLICK_COOLDOWN_SECONDS
         ):
