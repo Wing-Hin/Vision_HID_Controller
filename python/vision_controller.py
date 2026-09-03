@@ -1,24 +1,27 @@
 """
 Vision HID Controller - vision-only prototype.
 
-This version focuses on reliable camera input and object tracking. It does not
-talk to the Arduino yet. It only prints simulated commands such as:
+This version tracks a target and prints debug commands. When --serial-port is
+provided, it also sends the commands to a compatible Arduino HID board:
 
     MOVE 12 -5
-    CLICK
     STOP
 """
 
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
 import cv2
+import serial
+from serial.tools import list_ports
 from ultralytics import YOLO
 
 
@@ -31,8 +34,12 @@ MAX_SPEED = 40
 SMOOTHING_ALPHA = 0.25
 LOST_TIMEOUT = 0.5
 MIN_LOCK_MATCH_DISTANCE = 80
-CLICK_CONFIDENCE = 0.90
-CLICK_COOLDOWN_SECONDS = 1.0
+SIMILAR_DISTANCE_PIXELS = 10
+SERIAL_BAUD = 115200
+SERIAL_SEND_INTERVAL = 0.05
+ARM_REFRESH_INTERVAL = 0.25
+ARDUINO_STARTUP_DELAY = 2.0
+PAUSE_HOTKEY_VK = 0x77  # Windows virtual-key code for F8.
 
 REQUESTED_WIDTH = 1280
 REQUESTED_HEIGHT = 720
@@ -56,6 +63,45 @@ WINDOW_NAME = "Vision HID Controller"
 NO_TARGET = "NO_TARGET"
 LOCKED = "LOCKED"
 LOST = "LOST"
+
+
+class CursorPoint(ctypes.Structure):
+    """Windows POINT structure used to read the current cursor position."""
+
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+class GlobalPauseHotkey:
+    """Watch F8 globally and expose a thread-safe paused flag."""
+
+    def __init__(self) -> None:
+        self.paused = threading.Event()
+        self.stop_requested = threading.Event()
+        self.thread = threading.Thread(target=self._watch_key, daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_requested.set()
+        self.thread.join(timeout=0.2)
+
+    def _watch_key(self) -> None:
+        key_was_down = False
+
+        while not self.stop_requested.is_set():
+            key_is_down = bool(ctypes.windll.user32.GetAsyncKeyState(PAUSE_HOTKEY_VK) & 0x8000)
+
+            if key_is_down and not key_was_down:
+                if self.paused.is_set():
+                    self.paused.clear()
+                    print("Tracker resumed (F8)")
+                else:
+                    self.paused.set()
+                    print("Tracker paused (F8)")
+
+            key_was_down = key_is_down
+            time.sleep(0.02)
 
 
 def parse_args() -> argparse.Namespace:
@@ -134,12 +180,138 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional YOLO device, such as cpu, cuda, or 0. Leave unset for auto.",
     )
+    parser.add_argument(
+        "--serial-port",
+        default="COM6",
+        help="Arduino serial port. Defaults to COM6.",
+    )
+    parser.add_argument(
+        "--no-arduino",
+        action="store_const",
+        const=None,
+        dest="serial_port",
+        help="Run in simulation mode without opening an Arduino serial port.",
+    )
+    parser.add_argument(
+        "--serial-baud",
+        type=int,
+        default=SERIAL_BAUD,
+        help="Arduino serial baud rate.",
+    )
+    parser.add_argument(
+        "--list-serial-ports",
+        action="store_true",
+        help="List serial ports and exit without opening the camera.",
+    )
     return parser.parse_args()
+
+
+def print_serial_ports() -> None:
+    """Show serial devices so the Arduino port is easy to identify."""
+    ports = list(list_ports.comports())
+    if not ports:
+        print("No serial ports found.")
+        return
+
+    print("Available serial ports:")
+    for port in ports:
+        print(f"  {port.device}: {port.description}")
+
+
+class ArduinoController:
+    """Small line-based serial connection for the Arduino HID sketch."""
+
+    def __init__(self, port: str, baud: int) -> None:
+        print(f"Opening Arduino on {port} at {baud} baud...")
+        self.connection = serial.Serial(port, baud, timeout=0.05, write_timeout=0.1)
+
+        # Leonardo/Micro boards commonly reset when their serial port opens.
+        time.sleep(ARDUINO_STARTUP_DELAY)
+        self.connection.reset_input_buffer()
+        self.connection.reset_output_buffer()
+        self.last_command = ""
+        self.last_send_time = 0.0
+        self.last_arm_time = time.perf_counter()
+        self.write_line("ARM")
+        print("Arduino HID armed. Press q or Esc to stop and disarm it.")
+
+    def write_line(self, command: str) -> None:
+        """Send one newline-terminated ASCII command."""
+        self.connection.write((command + "\n").encode("ascii"))
+        self.connection.flush()
+
+    def send_command(self, command: str) -> None:
+        """Send changes immediately and repeat commands as a watchdog heartbeat."""
+        current_time = time.perf_counter()
+
+        # A camera or inference call can briefly stall while applications switch.
+        # Re-arm periodically so control recovers after the Arduino watchdog fires.
+        if current_time - self.last_arm_time >= ARM_REFRESH_INTERVAL:
+            self.write_line("ARM")
+            self.last_arm_time = current_time
+
+        should_send = (
+            command != self.last_command
+            or current_time - self.last_send_time >= SERIAL_SEND_INTERVAL
+        )
+        if not should_send:
+            return
+
+        self.write_line(command)
+        self.last_command = command
+        self.last_send_time = current_time
+
+        # Drain short Arduino acknowledgements so the receive buffer cannot grow.
+        if self.connection.in_waiting:
+            self.connection.read(self.connection.in_waiting)
+
+    def close(self) -> None:
+        """Stop movement, disarm HID, and close the port."""
+        if not self.connection.is_open:
+            return
+
+        try:
+            try:
+                self.write_line("STOP")
+                self.write_line("DISARM")
+            except serial.SerialException:
+                # The Arduino watchdog will disarm if the cable was unplugged.
+                pass
+        finally:
+            self.connection.close()
 
 
 def clamp(value: int, minimum: int, maximum: int) -> int:
     """Keep a number inside a safe range."""
     return max(minimum, min(maximum, value))
+
+
+def get_desktop_cursor_position() -> tuple[int, int]:
+    """Return the current Windows cursor position in primary-screen pixels."""
+    point = CursorPoint()
+    if not ctypes.windll.user32.GetCursorPos(ctypes.byref(point)):
+        raise RuntimeError("Windows could not read the current cursor position.")
+    return (point.x, point.y)
+
+
+def map_frame_point_to_desktop(
+    frame_point: tuple[int, int],
+    frame_size: tuple[int, int],
+) -> tuple[int, int]:
+    """Map a point in the camera/OBS frame onto the primary desktop."""
+    frame_width, frame_height = frame_size
+    desktop_width = ctypes.windll.user32.GetSystemMetrics(0)
+    desktop_height = ctypes.windll.user32.GetSystemMetrics(1)
+
+    if frame_width <= 1 or frame_height <= 1 or desktop_width <= 0 or desktop_height <= 0:
+        raise RuntimeError("Invalid frame or desktop dimensions.")
+
+    desktop_x = round(frame_point[0] * (desktop_width - 1) / (frame_width - 1))
+    desktop_y = round(frame_point[1] * (desktop_height - 1) / (frame_height - 1))
+    return (
+        clamp(desktop_x, 0, desktop_width - 1),
+        clamp(desktop_y, 0, desktop_height - 1),
+    )
 
 
 def camera_label(index: int, width: int, height: int) -> str:
@@ -382,18 +554,24 @@ def detect_objects(
 
 
 def choose_best_target(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Choose the best target by frame-centre distance, confidence, then size."""
+    """Choose by centre distance, using confidence and size for near ties."""
     if not candidates:
         return None
 
-    # Primary: nearest to frame centre. Ties then favor confidence and size.
-    return min(
-        candidates,
-        key=lambda candidate: (
-            candidate["distance_squared"],
-            -candidate["confidence"],
-            -candidate["area"],
-        ),
+    nearest_distance = min(
+        candidate["distance_squared"] ** 0.5 for candidate in candidates
+    )
+    similar_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate["distance_squared"] ** 0.5
+        <= nearest_distance + SIMILAR_DISTANCE_PIXELS
+    ]
+
+    # When positions are effectively tied, prefer the more reliable detection.
+    return max(
+        similar_candidates,
+        key=lambda candidate: (candidate["confidence"], candidate["area"]),
     )
 
 
@@ -584,56 +762,37 @@ def optimize_model(model: YOLO) -> None:
 
 
 def calculate_mouse_command(
-    target_centre: tuple[int, int] | None,
-    screen_centre: tuple[int, int],
-    previous_move: tuple[float, float],
+    desktop_target: tuple[int, int] | None,
+    cursor_position: tuple[int, int],
     deadzone: int,
     sensitivity: float,
     max_speed: int,
-    smoothing_alpha: float,
     tracking_state: str,
 ) -> dict[str, Any]:
-    """Convert raw pixel error into a smooth, clamped MOVE command."""
-    smoothing_alpha = max(0.0, min(1.0, smoothing_alpha))
-
-    if target_centre is None:
+    """Move toward the desktop target until the cursor reaches its dead zone."""
+    if desktop_target is None or tracking_state != LOCKED:
         return {
-            "raw_error": (0, 0),
+            "error": (0, 0),
             "move": (0, 0),
-            "filtered_move": (0.0, 0.0),
             "command": "STOP",
-            "status": NO_TARGET,
+            "status": tracking_state,
         }
 
-    raw_dx = target_centre[0] - screen_centre[0]
-    raw_dy = target_centre[1] - screen_centre[1]
+    error_x = desktop_target[0] - cursor_position[0]
+    error_y = desktop_target[1] - cursor_position[1]
 
-    target_move_x = 0 if abs(raw_dx) <= deadzone else raw_dx * sensitivity
-    target_move_y = 0 if abs(raw_dy) <= deadzone else raw_dy * sensitivity
+    # Move the pointer toward the detected target's position in the frame.
+    movement_x = 0 if abs(error_x) <= deadzone else error_x * sensitivity
+    movement_y = 0 if abs(error_y) <= deadzone else error_y * sensitivity
 
-    target_move_x = clamp(int(target_move_x), -max_speed, max_speed)
-    target_move_y = clamp(int(target_move_y), -max_speed, max_speed)
+    move_x = clamp(round(movement_x), -max_speed, max_speed)
+    move_y = clamp(round(movement_y), -max_speed, max_speed)
 
-    # Low-pass filter: move partway from the previous command toward the new one.
-    filtered_x = previous_move[0] + smoothing_alpha * (target_move_x - previous_move[0])
-    filtered_y = previous_move[1] + smoothing_alpha * (target_move_y - previous_move[1])
-
-    if abs(filtered_x) < 0.5:
-        filtered_x = 0.0
-    if abs(filtered_y) < 0.5:
-        filtered_y = 0.0
-
-    move_x = clamp(round(filtered_x), -max_speed, max_speed)
-    move_y = clamp(round(filtered_y), -max_speed, max_speed)
-
-    filtered_is_stopped = move_x == 0 and move_y == 0
-    command = "MOVE 0 0" if filtered_is_stopped else f"MOVE {move_x} {move_y}"
+    command = "STOP" if move_x == 0 and move_y == 0 else f"MOVE {move_x} {move_y}"
 
     return {
-        "raw_error": (raw_dx, raw_dy),
+        "error": (error_x, error_y),
         "move": (move_x, move_y),
-        "target_move": (target_move_x, target_move_y),
-        "filtered_move": (filtered_x, filtered_y),
         "command": command,
         "status": tracking_state,
     }
@@ -656,20 +815,30 @@ def draw_hud_line(
 
 def draw_overlay(
     frame: Any,
+    candidates: list[dict[str, Any]],
     detection: dict[str, Any] | None,
     movement: dict[str, Any],
     processing_fps: float,
     camera_fps: float,
+    inference_ms: float,
     target_class: str,
+    serial_status: str,
+    desktop_target: tuple[int, int] | None,
+    cursor_position: tuple[int, int],
 ) -> None:
     """Draw the target overlay, crosshair, guide line, and HUD."""
     height, width = frame.shape[:2]
     screen_centre = (width // 2, height // 2)
-    target_centre = detection["centre"] if detection else None
+    smoothed_centre = detection["centre"] if detection else None
+    raw_centre = detection["raw_centre"] if detection else None
     confidence = detection["confidence"] if detection else 0.0
-    target_distance = detection["distance_squared"] ** 0.5 if detection else 0.0
     lock_state = detection["lock_state"] if detection else NO_TARGET
     visible = detection.get("visible", False) if detection else False
+
+    # Thin boxes show every detection that passed class/confidence filtering.
+    for candidate in candidates:
+        x1, y1, x2, y2 = candidate["box"]
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (120, 120, 120), 1)
 
     cv2.drawMarker(
         frame,
@@ -684,8 +853,10 @@ def draw_overlay(
         x1, y1, x2, y2 = detection["box"]
         box_colour = (0, 255, 0) if visible else (0, 165, 255)
         cv2.rectangle(frame, (x1, y1), (x2, y2), box_colour, 2)
-        cv2.circle(frame, target_centre, 6, (0, 0, 255), -1)
-        cv2.line(frame, screen_centre, target_centre, (0, 255, 255), 2)
+        if visible:
+            cv2.circle(frame, raw_centre, 6, (255, 0, 255), -1)
+        cv2.circle(frame, smoothed_centre, 6, (0, 0, 255), -1)
+        cv2.line(frame, screen_centre, smoothed_centre, (0, 255, 255), 2)
 
         cv2.putText(
             frame,
@@ -697,20 +868,28 @@ def draw_overlay(
             2,
         )
 
-    target_text = str(target_centre) if target_centre else "None"
+    raw_error = (
+        (raw_centre[0] - screen_centre[0], raw_centre[1] - screen_centre[1])
+        if raw_centre and visible
+        else (0, 0)
+    )
     hud_rows = [
         ("Camera FPS", f"{camera_fps:.1f}"),
         ("Processing FPS", f"{processing_fps:.1f}"),
+        ("Inference time", f"{inference_ms:.1f} ms"),
         ("Target class", target_class),
         ("Target lock", lock_state),
         ("Confidence", f"{confidence:.2f}"),
-        ("Target centre", target_text),
-        ("Screen centre", str(screen_centre)),
-        ("Target distance", f"{target_distance:.1f}px"),
-        ("Raw error", str(movement["raw_error"])),
-        ("Filtered move", f"({movement['filtered_move'][0]:.1f}, {movement['filtered_move'][1]:.1f})"),
+        ("Raw target centre", str(raw_centre) if raw_centre else "None"),
+        ("Smoothed centre", str(smoothed_centre) if smoothed_centre else "None"),
+        ("Frame centre", str(screen_centre)),
+        ("Desktop target", str(desktop_target) if desktop_target else "None"),
+        ("Cursor position", str(cursor_position)),
+        ("Raw error", str(raw_error)),
+        ("Desktop error", str(movement["error"])),
         ("Status", movement["status"]),
         ("Movement command", movement["command"]),
+        ("Arduino", serial_status),
     ]
 
     for row_index, (label, value) in enumerate(hud_rows):
@@ -719,10 +898,19 @@ def draw_overlay(
 
 def main() -> None:
     args = parse_args()
+    if args.list_serial_ports:
+        print_serial_ports()
+        return
+
     model = YOLO(args.model)
     optimize_model(model)
     target_class_id = find_class_id(model, args.target_class)
     cap = open_camera(args.source, args.width, args.height, args.fps)
+    try:
+        arduino = ArduinoController(args.serial_port, args.serial_baud) if args.serial_port else None
+    except (serial.SerialException, OSError):
+        cap.release()
+        raise
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW_NAME, DISPLAY_WIDTH, DISPLAY_HEIGHT)
@@ -742,12 +930,12 @@ def main() -> None:
     print(f"Requested capture FPS: {args.fps}")
     print(f"Reported capture FPS: {actual_fps:.1f}")
     print(f"YOLO inference size: {args.imgsz}")
+    print(f"Arduino: {args.serial_port if arduino else 'simulation only'}")
+    print("Press F8 anywhere to pause/resume tracking output")
     print("Press q or Esc in the video window to quit")
 
     previous_time = time.perf_counter()
-    last_click_time = 0.0
     last_command = ""
-    previous_move = (0.0, 0.0)
     target_lock: dict[str, Any] = {
         "state": NO_TARGET,
         "last_detection": None,
@@ -755,81 +943,103 @@ def main() -> None:
         "smoothed_centre": None,
         "lost_since": None,
     }
+    pause_hotkey = GlobalPauseHotkey()
+    pause_hotkey.start()
 
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            print("STOP")
-            break
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                print("STOP")
+                break
 
-        current_time = time.perf_counter()
-        elapsed = current_time - previous_time
-        previous_time = current_time
-        processing_fps = 1.0 / elapsed if elapsed > 0 else 0.0
+            current_time = time.perf_counter()
+            elapsed = current_time - previous_time
+            previous_time = current_time
+            processing_fps = 1.0 / elapsed if elapsed > 0 else 0.0
 
-        height, width = frame.shape[:2]
-        screen_centre = (width // 2, height // 2)
-        candidates = detect_objects(
-            model,
-            frame,
-            args.target_class,
-            target_class_id,
-            args.confidence,
-            screen_centre,
-            args.imgsz,
-            args.device,
-        )
-        detection = update_target_lock(
-            candidates,
-            target_lock,
-            current_time,
-            args.smoothing,
-        )
-        target_centre = detection["centre"] if detection else None
-        movement = calculate_mouse_command(
-            target_centre,
-            screen_centre,
-            previous_move,
-            args.deadzone,
-            args.sensitivity,
-            args.max_speed,
-            args.smoothing,
-            detection["lock_state"] if detection else NO_TARGET,
-        )
-        previous_move = movement["filtered_move"]
+            height, width = frame.shape[:2]
+            screen_centre = (width // 2, height // 2)
+            inference_start = time.perf_counter()
+            candidates = detect_objects(
+                model,
+                frame,
+                args.target_class,
+                target_class_id,
+                args.confidence,
+                screen_centre,
+                args.imgsz,
+                args.device,
+            )
+            inference_ms = (time.perf_counter() - inference_start) * 1000.0
+            detection = update_target_lock(
+                candidates,
+                target_lock,
+                current_time,
+                args.smoothing,
+            )
+            target_centre = detection["centre"] if detection else None
+            desktop_target = (
+                map_frame_point_to_desktop(target_centre, (width, height))
+                if target_centre is not None
+                else None
+            )
+            cursor_position = get_desktop_cursor_position()
+            movement = calculate_mouse_command(
+                desktop_target,
+                cursor_position,
+                args.deadzone,
+                args.sensitivity,
+                args.max_speed,
+                detection["lock_state"] if detection else NO_TARGET,
+            )
 
-        if movement["command"] != last_command:
-            print(movement["command"])
-            last_command = movement["command"]
+            if pause_hotkey.paused.is_set():
+                movement = {
+                    "error": movement["error"],
+                    "move": (0, 0),
+                    "command": "STOP",
+                    "status": "PAUSED",
+                }
 
-        if (
-            detection
-            and detection.get("visible", True)
-            and detection["confidence"] >= CLICK_CONFIDENCE
-            and current_time - last_click_time >= CLICK_COOLDOWN_SECONDS
-        ):
-            print("CLICK")
-            last_click_time = current_time
+            if movement["command"] != last_command:
+                print(movement["command"])
+                last_command = movement["command"]
 
-        draw_overlay(
-            frame,
-            detection,
-            movement,
-            processing_fps,
-            actual_fps,
-            args.target_class,
-        )
-        cv2.imshow(WINDOW_NAME, frame)
+            if arduino is not None:
+                arduino.send_command(movement["command"])
 
-        key = cv2.waitKey(1) & 0xFF
-        window_visible = cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE)
+            draw_overlay(
+                frame,
+                candidates,
+                detection,
+                movement,
+                processing_fps,
+                actual_fps,
+                inference_ms,
+                args.target_class,
+                (
+                    "PAUSED"
+                    if pause_hotkey.paused.is_set()
+                    else "ARMED" if arduino else "SIMULATION"
+                ),
+                desktop_target,
+                cursor_position,
+            )
+            cv2.imshow(WINDOW_NAME, frame)
 
-        if key in (ord("q"), 27) or window_visible < 1:
-            print("STOP")
-            break
+            key = cv2.waitKey(1) & 0xFF
+            window_visible = cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE)
 
-    cap.release()
-    cv2.destroyAllWindows()
+            if key in (ord("q"), 27) or window_visible < 1:
+                print("STOP")
+                break
+    finally:
+        pause_hotkey.stop()
+        if arduino is not None:
+            arduino.close()
+        cap.release()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

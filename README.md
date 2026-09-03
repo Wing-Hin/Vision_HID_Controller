@@ -3,9 +3,9 @@
 Vision HID Controller is a Python + Arduino starter project for turning computer
 vision detections into mouse-style HID commands.
 
-This version focuses on the Python vision system only. It prints simulated
-commands such as `MOVE 12 -5`, `CLICK`, and `STOP`; it does not send commands to
-the Arduino yet.
+The Python program always prints commands such as `MOVE 12 -5` and `STOP` for
+debugging. With `--serial-port`, it also sends them to an Arduino-compatible
+USB HID board to control the mouse.
 
 ## Project Structure
 
@@ -46,6 +46,10 @@ python python/vision_controller.py --source 1
 
 Press `q`, `Esc`, or close the OpenCV window to stop.
 
+Press `F8` from any Windows application to pause or resume mouse movement. This
+global hotkey does not require the OpenCV window to be selected. Detection and
+the HUD continue running while movement output remains at `STOP`.
+
 ## Vision Features
 
 - Requests `1280x720` capture from the selected camera.
@@ -58,13 +62,13 @@ Press `q`, `Esc`, or close the OpenCV window to stop.
 - Ignores detections below `0.60` confidence.
 - If multiple people are visible, chooses the person whose bounding-box centre is
   closest to the blue screen-centre crosshair.
-- Draws a HUD with FPS, confidence, target centre, screen centre, raw error, and
-  movement command.
-- Prints smoothed and clamped movement commands such as `MOVE 12 -5`.
-- Shows `LOCKED` and prints `MOVE 0 0` when the target is inside the dead zone
-  around the crosshair.
-- Uses a low-pass filter so movement eases toward each new command instead of
-  snapping instantly.
+- Draws valid candidate boxes and highlights the locked target.
+- Draws a HUD with FPS, inference time, tracking state, confidence, raw and
+  smoothed target centres, frame centre, errors, and the movement command.
+- Smooths the target position, then prints scaled and clamped commands such as
+  `MOVE 12 -5`.
+- Prints `STOP` when no target is locked, a target is temporarily lost, or the
+  smoothed target position is inside the dead zone around the crosshair.
 
 ## Target Selection Algorithm
 
@@ -78,23 +82,29 @@ dy = target_y - screen_centre_y
 distance_squared = dx * dx + dy * dy
 ```
 
-The target with the smallest `distance_squared` is selected. This avoids tracking
-a random person when multiple people are visible and avoids the extra square
-root needed for true Euclidean distance.
+The target with the shortest Euclidean distance is selected. Targets within 10
+pixels of the nearest distance are treated as similar: higher confidence wins,
+then larger bounding-box area.
 
 ## Dead Zone Behavior
 
-The dead zone prevents jitter when the selected target is already close to the
-crosshair. If the target is detected but close enough to the centre, the HUD
-shows `LOCKED` and the printed command is `MOVE 0 0`. `STOP` means no valid
-target is currently detected or the script is exiting.
+The dead zone prevents jitter when the desktop cursor is already close to the
+mapped target position. If the cursor is within the dead zone, the HUD shows
+`LOCKED` and the command is `STOP`. `STOP` also applies when no valid target is
+locked, the lock is temporarily lost, or the script is exiting.
 
-## Movement Smoothing
+The smoothed target point is mapped proportionally from frame coordinates onto
+the primary desktop. The controller compares that desktop point with the live
+Windows cursor position, moves by the remaining error, and stops when the cursor
+reaches the dead zone around the target. This closed loop prevents continuous
+movement after the cursor reaches the item.
 
-Movement uses a low-pass filter:
+## Target Smoothing
+
+The detected target position uses an exponential low-pass filter:
 
 ```text
-filtered = previous + smoothing * (target - previous)
+smoothed = smoothing * raw + (1 - smoothing) * previous_smoothed
 ```
 
 The default smoothing value is `0.25`. Lower values feel smoother but respond
@@ -156,10 +166,14 @@ The HUD shows two FPS values:
 - `Processing FPS`: the full loop speed after camera read, YOLO inference,
   overlay drawing, and display.
 
-## Arduino Setup
+## Arduino HID Setup
 
 The Arduino sketch is included for later hardware integration. Use an Arduino
 Leonardo, Micro, Pro Micro, or another ATmega32U4-based board.
+
+This requires a native USB board supported by Arduino's `Mouse` library, such as
+an Arduino Leonardo, Micro, or ATmega32U4-based Pro Micro. A regular Uno cannot
+use this sketch as a native USB mouse.
 
 Open this sketch in the Arduino IDE:
 
@@ -167,10 +181,48 @@ Open this sketch in the Arduino IDE:
 arduino/Vision_HID_Controller/Vision_HID_Controller.ino
 ```
 
-This project does not connect Python to Arduino serial yet.
+Select the correct board and port, then upload it. The board starts **disarmed**
+and cannot move the mouse until Python sends `ARM`.
+
+List available ports:
+
+```bash
+python python/vision_controller.py --list-serial-ports
+```
+
+Run with the Arduino connected (replace `COM6` and the camera index as needed):
+
+```bash
+python python/vision_controller.py --source 0 --serial-port COM6
+```
+
+The default Arduino port is `COM6`, so the IDE Run button or the following
+command connects to COM6 automatically:
+
+```bash
+python python/vision_controller.py
+```
+
+To run detection without Arduino mouse movement:
+
+```bash
+python python/vision_controller.py --no-arduino
+```
+
+The serial protocol is deliberately small:
+
+- `ARM` enables HID movement.
+- `MOVE dx dy` performs one relative mouse movement.
+- `STOP` releases mouse buttons but keeps the connection armed.
+- `DISARM` blocks movement until another `ARM`.
+
+Python repeats the current command as a heartbeat. If messages stop for 5 seconds,
+the Arduino watchdog automatically disarms HID. Python periodically refreshes
+`ARM`, allowing control to recover after a temporary camera or inference stall.
+Closing the Python window sends `STOP` and `DISARM` before closing the serial port.
 
 ## Safety Notes
 
-The Python script only prints simulated commands. The Arduino sketch can move and
-click the real mouse once serial integration is added later, so keep movement
-limits small during future hardware testing.
+The Arduino sketch moves the real system pointer. Keep `MAX_SPEED` small during
+testing and keep the board's USB cable within reach. Press `q` or `Esc` in the
+OpenCV window to stop; unplugging the board is the final emergency stop.
