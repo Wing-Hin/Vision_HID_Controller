@@ -868,27 +868,14 @@ def draw_overlay(
             2,
         )
 
-    raw_error = (
-        (raw_centre[0] - screen_centre[0], raw_centre[1] - screen_centre[1])
-        if raw_centre and visible
-        else (0, 0)
-    )
     hud_rows = [
-        ("Camera FPS", f"{camera_fps:.1f}"),
         ("Processing FPS", f"{processing_fps:.1f}"),
         ("Inference time", f"{inference_ms:.1f} ms"),
-        ("Target class", target_class),
         ("Target lock", lock_state),
         ("Confidence", f"{confidence:.2f}"),
-        ("Raw target centre", str(raw_centre) if raw_centre else "None"),
-        ("Smoothed centre", str(smoothed_centre) if smoothed_centre else "None"),
-        ("Frame centre", str(screen_centre)),
-        ("Desktop target", str(desktop_target) if desktop_target else "None"),
+        ("Target position", str(desktop_target) if desktop_target else "None"),
         ("Cursor position", str(cursor_position)),
-        ("Raw error", str(raw_error)),
-        ("Desktop error", str(movement["error"])),
-        ("Status", movement["status"]),
-        ("Movement command", movement["command"]),
+        ("Command", movement["command"]),
         ("Arduino", serial_status),
     ]
 
@@ -897,16 +884,21 @@ def draw_overlay(
 
 
 def main() -> None:
+    # STARTUP 1: Read settings supplied on the command line.
     args = parse_args()
     if args.list_serial_ports:
         print_serial_ports()
         return
 
+    # STARTUP 2: Load the trained YOLO model that will detect people.
     model = YOLO(args.model)
     optimize_model(model)
     target_class_id = find_class_id(model, args.target_class)
+
+    # STARTUP 3: Open and configure the selected camera or video source.
     cap = open_camera(args.source, args.width, args.height, args.fps)
     try:
+        # STARTUP 4: Connect to Arduino. This is skipped in --no-arduino mode.
         arduino = ArduinoController(args.serial_port, args.serial_baud) if args.serial_port else None
     except (serial.SerialException, OSError):
         cap.release()
@@ -948,16 +940,19 @@ def main() -> None:
 
     try:
         while True:
+            # CAPTURE: Ask OpenCV for the next camera image (frame).
             ok, frame = cap.read()
             if not ok:
                 print("STOP")
                 break
 
+            # TIMING: Measure how quickly the complete loop is running.
             current_time = time.perf_counter()
             elapsed = current_time - previous_time
             previous_time = current_time
             processing_fps = 1.0 / elapsed if elapsed > 0 else 0.0
 
+            # DETECT: Give the frame to YOLO and collect valid people.
             height, width = frame.shape[:2]
             screen_centre = (width // 2, height // 2)
             inference_start = time.perf_counter()
@@ -972,6 +967,9 @@ def main() -> None:
                 args.device,
             )
             inference_ms = (time.perf_counter() - inference_start) * 1000.0
+
+            # TRACK: Acquire a person or follow the previously locked one.
+            # update_target_lock also smooths the target centre to reduce jitter.
             detection = update_target_lock(
                 candidates,
                 target_lock,
@@ -979,12 +977,19 @@ def main() -> None:
                 args.smoothing,
             )
             target_centre = detection["centre"] if detection else None
+
+            # MAP: Convert the camera position into a desktop position.
             desktop_target = (
                 map_frame_point_to_desktop(target_centre, (width, height))
                 if target_centre is not None
                 else None
             )
+
+            # FEEDBACK: Read where the real Windows cursor is now.
             cursor_position = get_desktop_cursor_position()
+
+            # CONTROL: Calculate MOVE or STOP from the remaining error.
+            # This function applies sensitivity, the dead zone, and the speed limit.
             movement = calculate_mouse_command(
                 desktop_target,
                 cursor_position,
@@ -994,6 +999,7 @@ def main() -> None:
                 detection["lock_state"] if detection else NO_TARGET,
             )
 
+            # PAUSE SAFETY: F8 overrides any movement with STOP.
             if pause_hotkey.paused.is_set():
                 movement = {
                     "error": movement["error"],
@@ -1002,6 +1008,7 @@ def main() -> None:
                     "status": "PAUSED",
                 }
 
+            # OUTPUT: Print changes and send the command to Arduino.
             if movement["command"] != last_command:
                 print(movement["command"])
                 last_command = movement["command"]
@@ -1009,6 +1016,7 @@ def main() -> None:
             if arduino is not None:
                 arduino.send_command(movement["command"])
 
+            # DISPLAY: Draw debugging information and show the frame.
             draw_overlay(
                 frame,
                 candidates,
@@ -1028,6 +1036,7 @@ def main() -> None:
             )
             cv2.imshow(WINDOW_NAME, frame)
 
+            # EXIT CHECK: q, Esc, or closing the window ends the program.
             key = cv2.waitKey(1) & 0xFF
             window_visible = cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE)
 
@@ -1035,6 +1044,7 @@ def main() -> None:
                 print("STOP")
                 break
     finally:
+        # CLEANUP: Always stop safely, disconnect Arduino, and release the camera.
         pause_hotkey.stop()
         if arduino is not None:
             arduino.close()
