@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-import cv2
+import cv2 
 import serial
 from serial.tools import list_ports
 from ultralytics import YOLO
